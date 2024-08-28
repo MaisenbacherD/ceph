@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <limits>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <string.h>
 #include <linux/blkzoned.h>
@@ -439,6 +441,44 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::mkfs(
   });
 }
 
+static std::string get_device_name(std::string const& path) {
+  char buff[PATH_MAX] = {};
+  // Resolve link to actuall device path if possible
+  ssize_t len = ::readlink(path.c_str(), buff, sizeof(buff)-1);
+  if (len != -1) {
+    buff[len] = '\0';
+  } else {
+    strncpy(buff, path.c_str(), sizeof(buff));
+  }
+  auto device_path = std::string(buff);
+
+  // Remove the device_path prefix "/dev/"
+  const std::string prefix = "/dev/";
+  if (device_path.substr(0, prefix.size()) == prefix) {
+    return device_path.substr(prefix.size());
+  }
+  return device_path;
+}
+
+static seastar::future<size_t>
+get_max_active_zones(std::string device_path)
+{
+  size_t mar = 0;
+  char filename[PATH_MAX];
+  auto device_name = get_device_name(device_path);
+
+  snprintf(filename, sizeof(filename), "/sys/block/%s/queue/max_active_zones", device_name.c_str());
+
+  // Read max_active_zones sysfs entry
+  if (std::ifstream f{filename}; !f.fail()) {
+    std::string line;
+    std::getline(f,line);
+    mar = std::stoi(line);
+  }
+
+  return seastar::make_ready_future<size_t>(mar);
+}
+
 ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
   device_config_t config)
 {
@@ -452,6 +492,7 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
     size_t(),
     size_t(),
     size_t(),
+    size_t(),
     [=, this]
     (auto &device,
      auto &stat,
@@ -459,11 +500,12 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
      auto &zone_size_sects,
      auto &nr_zones,
      auto &size,
+     auto &max_active_zones,
      auto &nr_cnv_zones) {
       return open_device(
 	device_path,
 	seastar::open_flags::rw
-      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &nr_cnv_zones](auto p) {
+      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &max_active_zones, &nr_cnv_zones](auto p) {
 	device = p.first;
 	stat = p.second;
 	return device.ioctl(
@@ -479,6 +521,10 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
           ceph_assert(zone_size_sects);
 	  return reset_device(device, zone_size_sects, nr_zones);
         }).then([&] {
+          return get_max_active_zones(device_path);
+        }).then([&](auto active_zones_limit){
+          max_active_zones = active_zones_limit;
+          DEBUG("Found max_active_zones limit of {}", max_active_zones);
           return get_blk_dev_size(device);
 	}).then([&](auto devsize) {
           size = devsize;
