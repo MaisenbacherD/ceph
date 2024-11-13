@@ -479,6 +479,37 @@ get_max_active_zones(std::string device_path)
   return seastar::make_ready_future<size_t>(mar);
 }
 
+void ZBDSegmentManager::set_active_zone_bit(size_t n){
+  LOG_PREFIX(ZBDSegmentManager::set_active_zone_bit);
+  size_t bitmap_size = this->active_zones_bitmap.size();
+  if (bitmap_size <= n) {
+    ERROR("Trying to set active_zone_bit out of range. active_zones_bitmap size: {}, bit to access: {}", bitmap_size, n);
+    return;
+  }
+  if (this->active_zones_bitmap.test_set(n)) {
+    if (current_active_zones == max_active_zones) {
+      ERROR("The active zone accounting is off because we are trying to open more zones than supported!");
+      return;
+    }
+    current_active_zones++;
+  }
+}
+
+void ZBDSegmentManager::reset_active_zone_bit(size_t n){
+  LOG_PREFIX(ZBDSegmentManager::reset_active_zone_bit);
+  size_t bitmap_size = this->active_zones_bitmap.size();
+  if (bitmap_size <= n) {
+    ERROR("Trying to reset active_zone_bit out of range. active_zones_bitmap size: {}, bit to access: {}", bitmap_size, n);
+    return;
+  }
+  if (current_active_zones == 0) {
+    ERROR("The active zone accounting is off because we are trying to go below 0!");
+    return;
+  }
+  current_active_zones--;
+  this->active_zones_bitmap.reset(n);
+}
+
 ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
   device_config_t config)
 {
@@ -492,7 +523,6 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
     size_t(),
     size_t(),
     size_t(),
-    size_t(),
     [=, this]
     (auto &device,
      auto &stat,
@@ -500,12 +530,11 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
      auto &zone_size_sects,
      auto &nr_zones,
      auto &size,
-     auto &max_active_zones,
      auto &nr_cnv_zones) {
       return open_device(
 	device_path,
 	seastar::open_flags::rw
-      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &max_active_zones, &nr_cnv_zones](auto p) {
+      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &nr_cnv_zones](auto p) {
 	device = p.first;
 	stat = p.second;
 	return device.ioctl(
@@ -516,6 +545,8 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
 	    return seastar::make_exception_future<int>(
 	      std::system_error(std::make_error_code(std::errc::io_error)));
 	  }
+	  DEBUG("DENNIS DEBUG: nr_zones {}", nr_zones);
+	  active_zones_bitmap.resize(nr_zones);
 	  return device.ioctl(BLKGETZONESZ, (void *)&zone_size_sects);
 	}).then([&](int ret) {
           ceph_assert(zone_size_sects);
@@ -660,6 +691,7 @@ ZBDSegmentManager::open_ertr::future<SegmentRef> ZBDSegmentManager::open(
     }
   ).safe_then([=, this] {
     DEBUG("segment {}, open successful", id);
+    this->set_active_zone_bit(id.device_segment_id());
     return open_ertr::future<SegmentRef>(
       open_ertr::ready_future_marker{},
       SegmentRef(new ZBDSegment(*this, id))
@@ -685,8 +717,9 @@ ZBDSegmentManager::release_ertr::future<> ZBDSegmentManager::release(
 	zone_op::RESET
       );
     }
-  ).safe_then([=] {
+  ).safe_then([=, this] {
     DEBUG("segment release successful");
+    this->reset_active_zone_bit(id.device_segment_id());
     return release_ertr::now();
   });
 }
@@ -734,8 +767,9 @@ Segment::close_ertr::future<> ZBDSegmentManager::segment_close(
 	zone_op::FINISH
       );
     }
-  ).safe_then([=] {
+  ).safe_then([=, this] {
     DEBUG("zone finish successful");
+    this->reset_active_zone_bit(id.device_segment_id());
     return Segment::close_ertr::now();
   });
 }
@@ -754,13 +788,19 @@ Segment::write_ertr::future<> ZBDSegmentManager::segment_write(
     seg_addr.get_segment_off(),
     get_offset(addr),
     bl.length());
+
+  auto id = seg_addr.get_segment_id().device_segment_id();
   stats.data_write.increment(bl.length());
   return do_writev(
     get_device_id(),
     device, 
     get_offset(addr), 
     std::move(bl), 
-    metadata.block_size);
+    metadata.block_size).safe_then([=, this] {
+    //TODO: Dennis this accounting has to be done before writing. Also respect the lenght and don't assume we are only writing one segment at a time
+      this->set_active_zone_bit(id);
+      return Segment::write_ertr::now();
+  });
 }
 
 device_id_t ZBDSegmentManager::get_device_id() const

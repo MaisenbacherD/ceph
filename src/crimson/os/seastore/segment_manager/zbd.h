@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab
 #pragma once
 
+#include <boost/dynamic_bitset/dynamic_bitset.hpp>
 #include <linux/blkzoned.h>
 
 #include <boost/intrusive_ptr.hpp>
@@ -189,6 +190,9 @@ namespace crimson::os::seastore::segment_manager::zbd {
     zbd_sm_metadata_t metadata;
     seastar::file device;
     uint32_t nr_zones;
+    size_t max_active_zones = 0;
+    boost::dynamic_bitset<uint8_t> active_zones_bitmap;
+    size_t current_active_zones = 0;
     struct effort_t {
       uint64_t num = 0;
       uint64_t bytes = 0;
@@ -213,6 +217,8 @@ namespace crimson::os::seastore::segment_manager::zbd {
       }
     } stats;
 
+    void reset_active_zone_bit(size_t n);
+    void set_active_zone_bit(size_t n);
     void register_metrics();
     seastar::metrics::metric_group metrics;
 
