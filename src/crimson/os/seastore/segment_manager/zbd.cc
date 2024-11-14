@@ -19,25 +19,25 @@ SET_SUBSYS(seastore_device);
 // limit the max padding buf size to 1MB
 #define MAX_PADDING_SIZE 4194304
 
-using crimson::os::seastore::segment_manager::zbd::zone_op;
-using enum crimson::os::seastore::segment_manager::zbd::zone_op;
-template <> struct fmt::formatter<zone_op>: fmt::formatter<std::string_view> {
+using z_op = crimson::os::seastore::segment_manager::zbd::zone_op;
+template <> struct fmt::formatter<z_op>: fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(zone_op s, FormatContext& ctx) {
+  auto format(z_op s, FormatContext& ctx) {
     std::string_view name = "Unknown";
     switch (s) {
-      case OPEN:
-        name = "BLKOPENZONE";
-        break;
-      case FINISH:
-        name = "BLKFINISHZONE";
-        break;
-      case CLOSE:
-        name = "BLKCLOSEZONE";
-        break;
-      case RESET:
-        name = "BLKRESETZONE";
-        break;
+      using enum z_op;
+        case OPEN:
+          name = "BLKOPENZONE";
+          break;
+        case FINISH:
+          name = "BLKFINISHZONE";
+          break;
+        case CLOSE:
+          name = "BLKCLOSEZONE";
+          break;
+        case RESET:
+          name = "BLKRESETZONE";
+          break;
     }
     return formatter<string_view>::format(name, ctx);
   }
@@ -558,6 +558,7 @@ blk_zone_op_ret blk_zone_op(seastar::file &device,
 
   unsigned long ioctl_op = 0;
   switch (op) {
+    using enum zone_op;
     case OPEN:
       ioctl_op = BLKOPENZONE;
       break;
