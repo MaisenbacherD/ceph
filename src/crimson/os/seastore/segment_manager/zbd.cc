@@ -21,13 +21,13 @@ SET_SUBSYS(seastore_device);
 // limit the max padding buf size to 1MB
 #define MAX_PADDING_SIZE 4194304
 
-using z_op = crimson::os::seastore::segment_manager::zbd::zone_op;
-template <> struct fmt::formatter<z_op>: fmt::formatter<std::string_view> {
+using crimson::os::seastore::segment_manager::zbd::zone_op;
+template <> struct fmt::formatter<zone_op>: fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(z_op s, FormatContext& ctx) {
+  auto format(zone_op s, FormatContext& ctx) {
     std::string_view name = "Unknown";
     switch (s) {
-      using enum z_op;
+      using enum zone_op;
         case OPEN:
           name = "BLKOPENZONE";
           break;
@@ -79,6 +79,7 @@ static zbd_sm_metadata_t make_metadata(
   size_t zone_size_sectors,
   size_t zone_capacity_sectors,
   size_t nr_cnv_zones,
+  size_t max_active_zones,
   size_t num_zones)
 {
   LOG_PREFIX(ZBDSegmentManager::make_metadata);
@@ -103,7 +104,7 @@ static zbd_sm_metadata_t make_metadata(
   WARN("Ignoring configuration values for device and segment size");
   INFO(
     "device size: {}, available size: {}, block size: {}, allocated size: {},"
-    " total zones {}, zone size: {}, zone capacity: {},"
+    " total zones {}, zone size: {}, zone capacity: {}, max active resources: {},"
     " total segments: {}, zones per segment: {}, segment size: {}"
     " conv zones: {}, swr zones: {}, per shard segments: {}"
     " per shard available size: {}",
@@ -114,6 +115,7 @@ static zbd_sm_metadata_t make_metadata(
     num_zones,
     zone_size,
     zone_capacity,
+    max_active_zones,
     segments,
     zones_per_segment,
     zone_capacity * zones_per_segment,
@@ -491,6 +493,8 @@ void ZBDSegmentManager::set_active_zone_bit(size_t n){
       ERROR("The active zone accounting is off because we are trying to open more zones than supported!");
       return;
     }
+
+    ERROR("Setting active_zone_bit on zone {}", n);
     current_active_zones++;
   }
 }
@@ -506,6 +510,7 @@ void ZBDSegmentManager::reset_active_zone_bit(size_t n){
     ERROR("The active zone accounting is off because we are trying to go below 0!");
     return;
   }
+  ERROR("Unsetting active_zone_bit on zone {}", n);
   current_active_zones--;
   this->active_zones_bitmap.reset(n);
 }
@@ -523,6 +528,7 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
     size_t(),
     size_t(),
     size_t(),
+    size_t(),
     [=, this]
     (auto &device,
      auto &stat,
@@ -530,11 +536,12 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
      auto &zone_size_sects,
      auto &nr_zones,
      auto &size,
+     auto &max_active_zones,
      auto &nr_cnv_zones) {
       return open_device(
 	device_path,
 	seastar::open_flags::rw
-      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &nr_cnv_zones](auto p) {
+      ).safe_then([=, this, &device, &stat, &sb, &zone_size_sects, &nr_zones, &size, &max_active_zones, &nr_cnv_zones](auto p) {
 	device = p.first;
 	stat = p.second;
 	return device.ioctl(
@@ -546,7 +553,9 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
 	      std::system_error(std::make_error_code(std::errc::io_error)));
 	  }
 	  DEBUG("DENNIS DEBUG: nr_zones {}", nr_zones);
-	  active_zones_bitmap.resize(nr_zones);
+	  this->active_zones_bitmap.resize(nr_zones);
+	  auto s = this->active_zones_bitmap.size();
+	  DEBUG("DENNIS DEBUG: bitmap_size: {}", s);
 	  return device.ioctl(BLKGETZONESZ, (void *)&zone_size_sects);
 	}).then([&](int ret) {
           ceph_assert(zone_size_sects);
@@ -575,6 +584,7 @@ ZBDSegmentManager::mkfs_ret ZBDSegmentManager::primary_mkfs(
 	    zone_size_sects,
 	    zone_capacity_sects,
 	    nr_cnv_zones,
+	    max_active_zones,
 	    nr_zones);
 	  metadata = sb;
 	  stats.metadata_write.increment(
@@ -649,7 +659,7 @@ blk_zone_op_ret blk_zone_op(seastar::file &device,
       ioctl_op = BLKCLOSEZONE;
       break;
     default:
-      ERROR("Invalid zone operation {}", op);
+      ERROR("Invalid zone operation {}", (uint32_t) op);
       ceph_assert(ioctl_op);
   }
 
@@ -658,14 +668,14 @@ blk_zone_op_ret blk_zone_op(seastar::file &device,
     &range
   ).then_wrapped([=](auto f) -> blk_zone_op_ret {
     if (f.failed()) {
-      ERROR("{} ioctl failed", op);
+      ERROR("{} ioctl failed", (uint32_t) op);
       return crimson::ct_error::input_output_error::make();
     } else {
       int ret = f.get();
       if (ret == 0) {
 	return seastar::now();
       } else {
-        ERROR("{} ioctl failed with return code {}", op, ret);
+        ERROR("{} ioctl failed with return code {}", (uint32_t) op, ret);
 	return crimson::ct_error::input_output_error::make();
       }
     }
@@ -788,19 +798,16 @@ Segment::write_ertr::future<> ZBDSegmentManager::segment_write(
     seg_addr.get_segment_off(),
     get_offset(addr),
     bl.length());
-
-  auto id = seg_addr.get_segment_id().device_segment_id();
   stats.data_write.increment(bl.length());
+  //TODO: DENNIS do accounting before write
+  //
+  this->set_active_zone_bit(seg_addr.get_segment_id().device_segment_id());
   return do_writev(
     get_device_id(),
     device, 
     get_offset(addr), 
     std::move(bl), 
-    metadata.block_size).safe_then([=, this] {
-    //TODO: Dennis this accounting has to be done before writing. Also respect the lenght and don't assume we are only writing one segment at a time
-      this->set_active_zone_bit(id);
-      return Segment::write_ertr::now();
-  });
+    metadata.block_size);
 }
 
 device_id_t ZBDSegmentManager::get_device_id() const

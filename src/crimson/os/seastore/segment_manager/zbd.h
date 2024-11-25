@@ -42,6 +42,7 @@ namespace crimson::os::seastore::segment_manager::zbd {
     size_t zone_capacity = 0;
     size_t block_size = 0;
     size_t zone_size = 0;
+  //  size_t max_active_zones = 0;
 
     std::vector<zbd_shard_info_t> shard_infos;
 
@@ -62,6 +63,7 @@ namespace crimson::os::seastore::segment_manager::zbd {
       denc(v.zone_capacity, p);
       denc(v.block_size, p);
       denc(v.zone_size, p);
+   //   denc(v.max_active_zones, p);
       denc(v.shard_infos, p);
       denc(v.meta, p);
       denc(v.magic, p);
@@ -81,6 +83,7 @@ namespace crimson::os::seastore::segment_manager::zbd {
         ceph_assert_always(shard_infos[i].segments > 0);
         ceph_assert_always(shard_infos[i].segments <= DEVICE_SEGMENT_ID_MAX);
       }
+      //TODO: DENNIS: maybe validate the active resources here
       ceph_assert_always(segment_capacity > 0);
       ceph_assert_always(segment_capacity <= SEGMENT_OFF_MAX);
     }
